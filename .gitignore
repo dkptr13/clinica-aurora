@@ -9,3 +9,13 @@ migration-report-*.json
 aurora-export-*.json
 static-audit-report.json
 *.broken-backup
+
+# Claves privadas de Google / Firebase: NUNCA subir al repositorio
+serviceAccount*.json
+service-account*.json
+*service-account*.json
+*firebase-adminsdk*.json
+*-adminsdk-*.json
+*google-credentials*.json
+aurora-secrets/
+secrets/

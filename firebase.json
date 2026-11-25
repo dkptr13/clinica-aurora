@@ -19,8 +19,15 @@
       "**/*.md",
       "**/*.broken-backup",
       "**/*.tmp",
+      "*.log",
       "migration-report*.json",
       "aurora-export*.json",
+      "serviceAccount*.json",
+      "*firebase-adminsdk*.json",
+      "*-adminsdk-*.json",
+      "*google-credentials*.json",
+      "aurora-secrets/**",
+      "secrets/**",
       "static-audit-report.json"
     ],
     "headers": [
