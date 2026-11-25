@@ -1,0 +1,462 @@
+rules_version = '2';
+
+// ============================================================================
+// Clínica Dental Aurora — Reglas de Cloud Firestore
+// ----------------------------------------------------------------------------
+// Principios:
+//  * Ningún permiso se basa en datos enviados por el navegador.
+//  * El rol se lee SIEMPRE de Custom Claims (request.auth.token.role).
+//  * Recepción gestiona agenda y administración, nunca historial clínico.
+//  * Los pacientes solo leen su propia ficha, citas, pagos y resúmenes
+//    clínicos expresamente compartidos.
+//  * Las notas clínicas internas viven en consultations y NUNCA son legibles
+//    por pacientes. La copia visible está en clinicalSummaries (solo servidor).
+//  * Colecciones internas (locks, contadores, copias, auditoría) son de solo
+//    escritura/lectura mediante Admin SDK (Cloud Functions/scripts).
+// ============================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ------------------------------------------------------------------ helpers
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function role() {
+      return request.auth.token.role;
+    }
+
+    function isAdmin() {
+      return signedIn() && role() == 'admin';
+    }
+
+    function isReception() {
+      return signedIn() && role() == 'reception';
+    }
+
+    function isDentist() {
+      return signedIn() && role() == 'dentist';
+    }
+
+    function isPatient() {
+      return signedIn() && role() == 'patient';
+    }
+
+    function isStaff() {
+      return isAdmin() || isReception() || isDentist();
+    }
+
+    function isClinical() {
+      return isAdmin() || isDentist();
+    }
+
+    function isAdminOrReception() {
+      return isAdmin() || isReception();
+    }
+
+    function patientPath(pid) {
+      return /databases/$(database)/documents/patients/$(pid);
+    }
+
+    function patientExists(pid) {
+      return exists(patientPath(pid));
+    }
+
+    function patientData(pid) {
+      return get(patientPath(pid)).data;
+    }
+
+    // Un paciente es propietario si el ID de la ficha es su uid (cuenta creada
+    // por el portal) o si la ficha fue vinculada por el servidor con userId.
+    function ownsPatient(pid) {
+      return isPatient() && patientExists(pid) && (
+        pid == request.auth.uid ||
+        patientData(pid).userId == request.auth.uid
+      );
+    }
+
+    // Odontólogo con relación asistencial: paciente asignado o cita suya.
+    function dentistHasPatient(pid) {
+      return isDentist() && patientExists(pid) &&
+        patientData(pid).assignedDentistId == request.auth.uid;
+    }
+
+    function validRole(r) {
+      return r in ['patient', 'admin', 'reception', 'dentist'];
+    }
+
+    function validStatus(s) {
+      return s in ['active', 'inactive', 'suspended'];
+    }
+
+    function validAppointmentStatus(s) {
+      return s in ['pending', 'confirmed', 'cancelled', 'done'];
+    }
+
+    function validPaymentStatus(s) {
+      return s in ['pending', 'paid', 'refunded', 'void'];
+    }
+
+    function isDateString(v) {
+      return v is string && v.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
+    }
+
+    function isTimeString(v) {
+      return v is string && v.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$');
+    }
+
+    function isEmail(v) {
+      return v is string && v.matches('^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$');
+    }
+
+    function maxLen(v, n) {
+      return v is string && v.size() <= n;
+    }
+
+    function noCardData(data) {
+      return !data.keys().hasAny([
+        'cardNumber', 'pan', 'cvv', 'cvc', 'expiry', 'cardExpiry',
+        'iban', 'accountNumber', 'stripeSecret'
+      ]);
+    }
+
+    // ------------------------------------------------------------------ users
+    // Perfil de usuario. El rol y el estado solo los modifica el servidor
+    // (Cloud Functions con Admin SDK). El cliente puede editar datos de
+    // contacto y preferencias, nunca privilegios.
+    match /users/{userId} {
+      allow get: if isAdmin() || (signedIn() && request.auth.uid == userId);
+      allow list: if isAdmin();
+
+      allow create, delete: if false;
+
+      allow update: if (
+        // El propio usuario: datos de contacto y preferencias.
+        (signedIn() && request.auth.uid == userId &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'name', 'phone', 'preferences', 'accessibility',
+            'updatedAt', 'lastLoginAt', 'photoPath'
+          ]) &&
+          (!('name' in request.resource.data) || (
+            request.resource.data.name is string &&
+            request.resource.data.name.size() >= 2 &&
+            request.resource.data.name.size() <= 120
+          )) &&
+          (!('phone' in request.resource.data) || maxLen(request.resource.data.phone, 30)) &&
+          (!('preferences' in request.resource.data) || request.resource.data.preferences is map)
+        ) ||
+        // Un administrador puede corregir datos de contacto/estado, pero el
+        // rol se cambia exclusivamente con la Cloud Function setUserRole.
+        (isAdmin() &&
+          request.resource.data.role == resource.data.role &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'name', 'phone', 'status', 'preferences', 'accessibility',
+            'photoPath', 'updatedAt', 'lastLoginAt'
+          ]) &&
+          (!('status' in request.resource.data) || validStatus(request.resource.data.status))
+        )
+      );
+    }
+
+    // --------------------------------------------------------------- patients
+    match /patients/{patientId} {
+      allow get: if isAdminOrReception() ||
+        (signedIn() && request.auth.uid == patientId) ||
+        (isPatient() && resource.data.userId == request.auth.uid) ||
+        dentistHasPatient(patientId);
+
+      // Las consultas de listado deben estar restringidas por la app:
+      //  - recepción/admin: sin filtro de propietario.
+      //  - odontólogo: assignedDentistId == uid.
+      //  - paciente: no puede listar (solo get de su ficha).
+      allow list: if isAdminOrReception() ||
+        (isDentist() && resource.data.assignedDentistId == request.auth.uid);
+
+      allow create: if isAdminOrReception() &&
+        request.resource.data.keys().hasAll(['fn', 'ln', 'em', 'ph', 'status']) &&
+        request.resource.data.keys().hasOnly([
+          'fn', 'ln', 'bd', 'ph', 'em', 'addr', 'assignedDentistId',
+          'userId', 'status', 'adminNotes', 'createdAt', 'updatedAt',
+          'createdBy', 'updatedBy', 'demo', 'legacyId', 'searchName'
+        ]) &&
+        request.resource.data.fn is string && request.resource.data.fn.size() > 0 &&
+        request.resource.data.fn.size() <= 80 &&
+        request.resource.data.ln is string && request.resource.data.ln.size() > 0 &&
+        request.resource.data.ln.size() <= 120 &&
+        isEmail(request.resource.data.em) &&
+        maxLen(request.resource.data.ph, 30) &&
+        maxLen(request.resource.data.addr, 300) &&
+        validStatus(request.resource.data.status) &&
+        noCardData(request.resource.data);
+
+      allow update: if (
+        // Personal administrativo: ficha completa (nunca datos clínicos).
+        (isAdminOrReception() &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'fn', 'ln', 'bd', 'ph', 'em', 'addr', 'assignedDentistId',
+            'status', 'adminNotes', 'updatedAt', 'updatedBy', 'searchName'
+          ]) &&
+          (!('em' in request.resource.data) || isEmail(request.resource.data.em)) &&
+          (!('status' in request.resource.data) || validStatus(request.resource.data.status)) &&
+          noCardData(request.resource.data)
+        ) ||
+        // El paciente solo puede cambiar su teléfono y dirección.
+        (ownsPatient(patientId) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'ph', 'addr', 'updatedAt'
+          ]) &&
+          maxLen(request.resource.data.ph, 30) &&
+          maxLen(request.resource.data.addr, 300)
+        )
+      );
+
+      allow delete: if isAdmin();
+
+      // Documentos clínicos: metadatos en Firestore; binarios en Storage.
+      match /documents/{documentId} {
+        allow get: if isAdminOrReception() ||
+          (isClinical() && (isAdmin() || dentistHasPatient(patientId))) ||
+          (ownsPatient(patientId) && resource.data.visibleToPatient == true);
+
+        allow list: if isAdminOrReception() ||
+          (isClinical() && (isAdmin() || dentistHasPatient(patientId))) ||
+          ownsPatient(patientId);
+
+        allow create, update: if (isAdminOrReception() || (isDentist() && dentistHasPatient(patientId))) &&
+          request.resource.data.patientId == patientId &&
+          request.resource.data.keys().hasOnly([
+            'patientId', 'consultationId', 'type', 'fileName', 'contentType',
+            'size', 'storagePath', 'visibleToPatient', 'uploadedBy',
+            'createdAt', 'updatedAt', 'description'
+          ]) &&
+          request.resource.data.type in ['radiograph', 'photo', 'consent', 'invoice', 'admin', 'document'] &&
+          request.resource.data.size is number &&
+          request.resource.data.size <= 26214400 &&
+          request.resource.data.storagePath is string &&
+          request.resource.data.storagePath.matches('^patients/' + patientId + '/.*') &&
+          noCardData(request.resource.data);
+
+        allow delete: if isAdmin();
+      }
+
+      // Mensajería asociada al paciente.
+      match /messages/{messageId} {
+        allow get, list: if isAdminOrReception() ||
+          (isDentist() && dentistHasPatient(patientId)) ||
+          ownsPatient(patientId);
+
+        allow create: if (isAdminOrReception() ||
+          (isDentist() && dentistHasPatient(patientId)) ||
+          ownsPatient(patientId)) &&
+          request.resource.data.patientId == patientId &&
+          request.resource.data.senderId == request.auth.uid &&
+          request.resource.data.keys().hasOnly([
+            'patientId', 'senderId', 'senderRole', 'senderName', 'body',
+            'createdAt', 'readBy'
+          ]) &&
+          request.resource.data.body is string &&
+          request.resource.data.body.size() > 0 &&
+          request.resource.data.body.size() <= 4000 &&
+          request.resource.data.senderRole == role();
+
+        allow update: if (isAdminOrReception() ||
+          (isDentist() && dentistHasPatient(patientId)) ||
+          ownsPatient(patientId)) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['readBy']);
+
+        allow delete: if isAdmin();
+      }
+    }
+
+    // ----------------------------------------------------------- appointments
+    // Escrituras exclusivamente mediante Cloud Functions transaccionales para
+    // impedir dobles reservas y manipulación de estados desde el navegador.
+    match /appointments/{appointmentId} {
+      allow get: if isAdminOrReception() ||
+        (isDentist() && resource.data.dentistId == request.auth.uid) ||
+        (isPatient() && ownsPatient(resource.data.patientId));
+
+      allow list: if isAdminOrReception() ||
+        (isDentist() && resource.data.dentistId == request.auth.uid) ||
+        (isPatient() && ownsPatient(resource.data.patientId));
+
+      allow create, update, delete: if false;
+    }
+
+    // ----------------------------------------------------------- consultations
+    // Historial clínico interno. Recepción no puede leerlo.
+    match /consultations/{consultationId} {
+      allow get, list: if isAdmin() ||
+        (isDentist() && (
+          resource.data.dentistId == request.auth.uid ||
+          (patientExists(resource.data.patientId) && patientData(resource.data.patientId).assignedDentistId == request.auth.uid)
+        ));
+
+      allow create: if isClinical() &&
+        request.resource.data.keys().hasAll([
+          'patientId', 'date', 'treatment', 'dentistId', 'notes',
+          'diagnosis', 'plan', 'evolution', 'share', 'createdAt'
+        ]) &&
+        request.resource.data.keys().hasOnly([
+          'patientId', 'appointmentId', 'date', 'treatment', 'dentistId',
+          'notes', 'diagnosis', 'plan', 'evolution', 'sharedSummary', 'share',
+          'attachments', 'createdAt', 'updatedAt', 'createdBy', 'updatedBy',
+          'visibleToPatient'
+        ]) &&
+        isDateString(request.resource.data.date) &&
+        (isAdmin() || request.resource.data.dentistId == request.auth.uid) &&
+        request.resource.data.notes is string &&
+        request.resource.data.notes.size() > 0 &&
+        request.resource.data.notes.size() <= 20000 &&
+        maxLen(request.resource.data.diagnosis, 10000) &&
+        maxLen(request.resource.data.plan, 10000) &&
+        maxLen(request.resource.data.evolution, 10000) &&
+        maxLen(request.resource.data.sharedSummary, 5000) &&
+        noCardData(request.resource.data);
+
+      allow update: if isClinical() &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'appointmentId', 'date', 'treatment', 'notes', 'diagnosis',
+          'plan', 'evolution', 'sharedSummary', 'share', 'attachments',
+          'updatedAt', 'updatedBy', 'visibleToPatient'
+        ]) &&
+        (isAdmin() || resource.data.dentistId == request.auth.uid) &&
+        maxLen(request.resource.data.notes, 20000) &&
+        maxLen(request.resource.data.diagnosis, 10000) &&
+        maxLen(request.resource.data.plan, 10000) &&
+        maxLen(request.resource.data.evolution, 10000) &&
+        maxLen(request.resource.data.sharedSummary, 5000) &&
+        noCardData(request.resource.data);
+
+      allow delete: if isAdmin();
+    }
+
+    // Copia saneada visible para el paciente. Solo la escribe Cloud Functions.
+    match /clinicalSummaries/{summaryId} {
+      allow get: if isAdmin() ||
+        (isDentist() && resource.data.dentistId == request.auth.uid) ||
+        (isPatient() && ownsPatient(resource.data.patientId));
+
+      allow list: if isAdmin() ||
+        (isDentist() && resource.data.dentistId == request.auth.uid) ||
+        (isPatient() && ownsPatient(resource.data.patientId));
+
+      allow create, update, delete: if false;
+    }
+
+    // --------------------------------------------------------------- payments
+    match /payments/{paymentId} {
+      allow get: if isAdminOrReception() ||
+        (isPatient() && ownsPatient(resource.data.patientId));
+
+      allow list: if isAdminOrReception() ||
+        (isPatient() && ownsPatient(resource.data.patientId));
+
+      allow create: if isAdminOrReception() &&
+        request.resource.data.keys().hasAll(['patientId', 'concept', 'amount', 'status', 'date', 'createdAt']) &&
+        request.resource.data.keys().hasOnly([
+          'patientId', 'treatment', 'concept', 'amount', 'status', 'date',
+          'invoiceNumber', 'invoicePath', 'notes', 'createdAt', 'updatedAt',
+          'createdBy', 'updatedBy', 'paidAt', 'paidBy', 'demo', 'legacyId'
+        ]) &&
+        request.resource.data.amount is number &&
+        request.resource.data.amount > 0 &&
+        request.resource.data.amount <= 100000 &&
+        validPaymentStatus(request.resource.data.status) &&
+        isDateString(request.resource.data.date) &&
+        maxLen(request.resource.data.concept, 300) &&
+        noCardData(request.resource.data);
+
+      allow update: if isAdminOrReception() &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'status', 'invoiceNumber', 'invoicePath', 'notes', 'paidAt',
+          'paidBy', 'updatedAt', 'updatedBy'
+        ]) &&
+        (!('status' in request.resource.data) || validPaymentStatus(request.resource.data.status)) &&
+        noCardData(request.resource.data);
+
+      allow delete: if isAdmin();
+    }
+
+    // ---------------------------------------------------------------- requests
+    // La creación pública se hace por Cloud Functions (Admin SDK), nunca
+    // directamente desde el navegador. Así se valida disponibilidad, se
+    // aplican límites de uso y no se exponen citas de otros pacientes.
+    match /requests/{requestId} {
+      allow get, list: if isAdminOrReception() ||
+        (isDentist() && resource.data.dentistId == request.auth.uid) ||
+        (isPatient() && ownsPatient(resource.data.patientId));
+
+      allow create, delete: if false;
+
+      allow update: if isAdminOrReception() &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'status', 'updatedAt', 'updatedBy', 'patientId', 'appointmentId'
+        ]) &&
+        request.resource.data.status in ['new', 'accepted', 'rejected', 'expired'];
+    }
+
+    // ----------------------------------------------------------------- catalog
+    match /treatments/{treatmentId} {
+      allow read: if true;
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /dentists/{dentistId} {
+      allow read: if true;
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /settings/{settingId} {
+      allow get: if true;
+      allow list: if isAdmin();
+      allow write: if isAdmin();
+    }
+
+    // ----------------------------------------------------------- notifications
+    match /notifications/{notificationId} {
+      allow get, list: if signedIn() && (
+        resource.data.userId == request.auth.uid || isAdmin()
+      );
+
+      allow update: if signedIn() &&
+        resource.data.userId == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read', 'readAt']) &&
+        request.resource.data.read == true;
+
+      allow delete: if signedIn() && resource.data.userId == request.auth.uid;
+
+      allow create: if false;
+    }
+
+    // ---------------------------------------------------------------- audit
+    match /auditLogs/{logId} {
+      allow get, list: if isAdmin();
+      allow create, update, delete: if false;
+    }
+
+    // ------------------------------------------------------- internal / server
+    match /scheduleLocks/{lockId} {
+      allow read, write: if false; // solo Admin SDK
+    }
+
+    match /counters/{counterId} {
+      allow read, write: if false;
+    }
+
+    match /rateLimits/{limitId} {
+      allow read, write: if false;
+    }
+
+    match /backups/{backupId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    // Cualquier colección no declarada queda cerrada.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

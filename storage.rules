@@ -1,0 +1,114 @@
+rules_version = '2';
+
+// ============================================================================
+// Clínica Dental Aurora — Reglas de Firebase Storage
+// ----------------------------------------------------------------------------
+// Estructura:
+//   patients/{patientId}/clinical/**   → solo personal clínico autorizado
+//   patients/{patientId}/shared/**     → personal clínico + paciente propietario
+//   patients/{patientId}/admin/**      → administración (facturas, consentimientos)
+//   patients/{patientId}/invoices/**   → administración + paciente propietario
+//
+// Nunca se generan URL públicas permanentes. La app descarga con getBlob() y
+// crea un object URL temporal en memoria.
+// ============================================================================
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function role() {
+      return request.auth.token.role;
+    }
+
+    function isAdmin() {
+      return signedIn() && role() == 'admin';
+    }
+
+    function isReception() {
+      return signedIn() && role() == 'reception';
+    }
+
+    function isDentist() {
+      return signedIn() && role() == 'dentist';
+    }
+
+    function isPatient() {
+      return signedIn() && role() == 'patient';
+    }
+
+    function isClinical() {
+      return isAdmin() || isDentist();
+    }
+
+    function patientDoc(pid) {
+      return firestore.get(/databases/(default)/documents/patients/$(pid)).data;
+    }
+
+    function ownsPatient(pid) {
+      return isPatient() && (
+        pid == request.auth.uid ||
+        (firestore.exists(/databases/(default)/documents/patients/$(pid)) &&
+         patientDoc(pid).userId == request.auth.uid)
+      );
+    }
+
+    function assignedDentist(pid) {
+      return isDentist() &&
+        firestore.exists(/databases/(default)/documents/patients/$(pid)) &&
+        patientDoc(pid).assignedDentistId == request.auth.uid;
+    }
+
+    function safeFile() {
+      return request.resource.size <= 26214400 &&
+        (request.resource.contentType.matches('image/.*') ||
+         request.resource.contentType == 'application/pdf');
+    }
+
+    function safeName() {
+      return request.resource.name.size() <= 300;
+    }
+
+    match /patients/{patientId}/clinical/{allPaths=**} {
+      allow read: if isAdmin() || assignedDentist(patientId);
+      allow create, update: if isClinical() && (isAdmin() || assignedDentist(patientId)) &&
+        safeFile() && safeName();
+      allow delete: if isAdmin();
+    }
+
+    match /patients/{patientId}/shared/{allPaths=**} {
+      allow read: if isAdmin() ||
+        assignedDentist(patientId) ||
+        isReception() ||
+        ownsPatient(patientId);
+      allow create, update: if isClinical() && (isAdmin() || assignedDentist(patientId)) &&
+        safeFile() && safeName();
+      allow delete: if isAdmin();
+    }
+
+    match /patients/{patientId}/admin/{allPaths=**} {
+      allow read: if isAdmin() || isReception();
+      allow create, update: if isAdmin() || isReception();
+      allow delete: if isAdmin();
+    }
+
+    match /patients/{patientId}/invoices/{allPaths=**} {
+      allow read: if isAdmin() || isReception() || ownsPatient(patientId);
+      allow create, update: if isAdmin() || isReception();
+      allow delete: if isAdmin();
+    }
+
+    // Copias de seguridad y artefactos internos: nunca accesibles desde la web.
+    match /backups/{allPaths=**} {
+      allow read, write: if false;
+    }
+
+    // Cualquier otra ruta queda cerrada por defecto.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

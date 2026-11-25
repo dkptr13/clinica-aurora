@@ -1,0 +1,19 @@
+{
+  "name": "clinicadental-aurora-functions",
+  "description": "Backend seguro de Clínica Dental Aurora (Firebase Functions)",
+  "engines": {
+    "node": "20"
+  },
+  "main": "index.js",
+  "private": true,
+  "scripts": {
+    "lint": "node --check index.js",
+    "serve": "firebase emulators:start --only functions,firestore,auth,storage"
+  },
+  "dependencies": {
+    "firebase-admin": "^13.0.2",
+    "firebase-functions": "^6.3.0",
+    "google-auth-library": "^9.15.1"
+  },
+  "devDependencies": {}
+}
