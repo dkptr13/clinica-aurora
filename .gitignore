@@ -1,0 +1,11 @@
+node_modules/
+functions/node_modules/
+tests/node_modules/
+.firebase/
+*.log
+.env
+functions/.env
+migration-report-*.json
+aurora-export-*.json
+static-audit-report.json
+*.broken-backup

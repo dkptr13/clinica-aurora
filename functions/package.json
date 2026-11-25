@@ -8,7 +8,10 @@
   "private": true,
   "scripts": {
     "lint": "node --check index.js",
-    "serve": "firebase emulators:start --only functions,firestore,auth,storage"
+    "serve": "firebase emulators:start --only functions,firestore,auth,storage",
+    "audit": "node ../scripts/static-audit.js",
+    "bootstrap": "node ../scripts/bootstrap-admin.js",
+    "migrate": "node ../scripts/migrate-local-data.js"
   },
   "dependencies": {
     "firebase-admin": "^13.0.2",

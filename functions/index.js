@@ -6,8 +6,10 @@
  * Toda escritura sensible se valida aquí. Las reglas de Firestore impiden que
  * el navegador cree citas, modifique roles o fabrique resúmenes clínicos.
  *
- * Región: europe-west1 (configurable con FUNCTIONS_REGION). No cambiar la
- * región de Firestore/Storage sin revisar antes la ubicación real del proyecto.
+ * Región: europe-west9 (París), la misma que la base Firestore del proyecto
+ * clinicadental-aurora, verificada el 2026-11-25. Se puede sobreescribir con
+ * FUNCTIONS_REGION, pero no cambiar la región de Firestore/Storage sin revisar
+ * antes la ubicación real y los requisitos RGPD/LOPDGDD.
  * ========================================================================== */
 
 const crypto = require('node:crypto');
@@ -21,10 +23,9 @@ const { GoogleAuth } = require('google-auth-library');
 
 admin.initializeApp();
 const db = admin.firestore();
-const FieldValue = admin.firestore.FieldValue;
-const Timestamp = admin.firestore.Timestamp;
+const { FieldValue, Timestamp } = require('firebase-admin/firestore');
 
-const REGION = process.env.FUNCTIONS_REGION || 'europe-west1';
+const REGION = process.env.FUNCTIONS_REGION || 'europe-west9';
 setGlobalOptions({ region: REGION, maxInstances: 20 });
 
 const ROLES = ['patient', 'admin', 'reception', 'dentist'];
@@ -285,6 +286,52 @@ async function patientUserId(patientId) {
   return snap.exists ? (snap.data().userId || null) : null;
 }
 
+// Los odontólogos del catálogo usan IDs estables (d1, d2...) y se vinculan a
+// una cuenta de Authentication mediante users/{uid}.dentistId. Las reglas y
+// las Functions nunca comparan el ID de catálogo con el UID de la cuenta.
+let dentistUsersCache = { at: 0, data: [] };
+async function dentistUsers(force = false) {
+  const now = Date.now();
+  if (!force && dentistUsersCache.data.length && now - dentistUsersCache.at < 5 * 60 * 1000) {
+    return dentistUsersCache.data;
+  }
+  const snap = await db.collection('users')
+    .where('role', '==', 'dentist')
+    .where('status', '==', 'active')
+    .limit(50).get();
+  const data = snap.docs.map((d) => ({ uid: d.id, ...d.data() }));
+  dentistUsersCache = { at: now, data };
+  return data;
+}
+
+async function dentistUidFor(dentistId) {
+  if (!dentistId) return '';
+  const list = await dentistUsers();
+  const found = list.find((u) => u.dentistId === dentistId);
+  return found ? found.uid : '';
+}
+
+async function dentistProfileFor(uid) {
+  if (!uid) return null;
+  const snap = await db.doc('users/' + uid).get();
+  if (!snap.exists) return null;
+  const data = snap.data();
+  return { uid, ...data, dentistId: String(data.dentistId || '') };
+}
+
+async function addCareTeam(tx, patientId, dentistId, now) {
+  if (!patientId || !dentistId) return;
+  const ref = db.doc('patients/' + patientId);
+  const snap = await tx.get(ref);
+  if (!snap.exists) return;
+  const patient = snap.data();
+  const patch = { updatedAt: now };
+  if (!patient.assignedDentistId) patch.assignedDentistId = dentistId;
+  const team = Array.isArray(patient.careTeamIds) ? patient.careTeamIds : [];
+  if (!team.includes(dentistId)) patch.careTeamIds = [...new Set([...team, dentistId])];
+  if (Object.keys(patch).length > 1) tx.set(ref, patch, { merge: true });
+}
+
 async function notification(userId, data) {
   if (!userId) return;
   await db.collection('notifications').add({
@@ -324,15 +371,15 @@ exports.registerPatient = onCall({ cors: true }, async (request) => {
   if (password.length > 128) throw new HttpsError('invalid-argument', 'La contraseña es demasiado larga.');
   if (request.data?.consent !== true) throw new HttpsError('invalid-argument', 'Debes aceptar la política de privacidad.');
 
-  let existingPatient = null;
+  let possibleMatch = null;
   try {
     const q = await db.collection('patients').where('em', '==', mail).limit(1).get();
-    if (!q.empty) existingPatient = { id: q.docs[0].id, ...q.docs[0].data() };
+    if (!q.empty) possibleMatch = { id: q.docs[0].id, ...q.docs[0].data() };
   } catch (error) {
-    logger.warn('No se pudo buscar paciente existente', error);
+    logger.warn('No se pudo buscar una ficha previa', error);
   }
 
-  if (existingPatient?.userId) {
+  if (possibleMatch?.userId) {
     throw new HttpsError('already-exists', 'Ya existe una cuenta vinculada a ese correo. Inicia sesión o recupera tu contraseña.');
   }
 
@@ -352,7 +399,10 @@ exports.registerPatient = onCall({ cors: true }, async (request) => {
   }
 
   const uid = userRecord.uid;
-  const patientId = existingPatient ? existingPatient.id : uid;
+  // No se vincula automáticamente una ficha preexistente por correo: un tercero
+  // podría registrarse con el correo de un paciente y leer su historial. La
+  // vinculación la autoriza recepción/administración tras verificar identidad.
+  const patientId = uid;
   const parts = initialsName(name);
   const now = Timestamp.now();
 
@@ -381,19 +431,19 @@ exports.registerPatient = onCall({ cors: true }, async (request) => {
     }, { merge: true });
 
     batch.set(db.doc('patients/' + patientId), {
-      fn: existingPatient?.fn || parts.fn,
-      ln: existingPatient?.ln || parts.ln,
-      bd: existingPatient?.bd || '',
+      fn: parts.fn,
+      ln: parts.ln,
+      bd: '',
       ph: tel,
       em: mail,
-      addr: existingPatient?.addr || '',
-      assignedDentistId: existingPatient?.assignedDentistId || '',
+      addr: '',
+      assignedDentistId: '',
       userId: uid,
       status: 'active',
-      adminNotes: existingPatient?.adminNotes || '',
-      searchName: ((existingPatient?.fn || parts.fn) + ' ' + (existingPatient?.ln || parts.ln) + ' ' + mail).toLowerCase(),
-      updatedAt: now,
-      ...(existingPatient ? {} : { createdAt: now, createdBy: 'self-registration' })
+      searchName: `${parts.fn} ${parts.ln} ${mail}`.toLowerCase(),
+      createdAt: now,
+      createdBy: 'self-registration',
+      updatedAt: now
     }, { merge: true });
 
     batch.set(db.collection('notifications').doc(), {
@@ -406,10 +456,10 @@ exports.registerPatient = onCall({ cors: true }, async (request) => {
     });
 
     await batch.commit();
-    await audit({ uid, role: 'patient' }, 'patient.register', 'patients', patientId, { patientId });
+    await audit({ uid, role: 'patient' }, 'patient.register', 'patients', patientId, { patientId, possibleMatchId: possibleMatch?.id || '' });
 
     const customToken = await admin.auth().createCustomToken(uid, { role: 'patient' });
-    return { ok: true, customToken, uid, patientId };
+    return { ok: true, customToken, uid, patientId, possibleMatchId: possibleMatch?.id || '' };
   } catch (error) {
     try { await admin.auth().deleteUser(uid); } catch (cleanupError) { logger.error('No se pudo revertir la cuenta', cleanupError); }
     logger.error('Error al registrar paciente', error);
@@ -669,7 +719,9 @@ exports.adminSaveAppointment = onCall({ cors: true }, async (request) => {
   const date = assertDate(request.data?.date);
   const time = assertTime(request.data?.time);
   const status = APPT_STATUS.includes(request.data?.status) ? request.data.status : 'confirmed';
-  const note = cleanMultiline(request.data?.note || '', 2000);
+  // Las notas internas no se guardan en la cita porque el paciente puede leer su
+  // propia cita. Cualquier detalle clínico va en consultations/summaries.
+  const note = '';
   const box = clean(request.data?.box || (dentist.id === 'd1' ? 'Gabinete 1' : 'Gabinete 2'), 60);
   const windowError = validWindow(config, date, time, treatment.min);
   if (windowError) throw new HttpsError('invalid-argument', windowError);
@@ -686,6 +738,7 @@ exports.adminSaveAppointment = onCall({ cors: true }, async (request) => {
   const apptRef = id ? db.doc('appointments/' + id) : db.collection('appointments').doc();
   const newLock = lockRef(date, dentist.id);
   const now = Timestamp.now();
+  const dentistUid = await dentistUidFor(dentist.id);
 
   const result = await db.runTransaction(async (tx) => {
     const existing = id ? await tx.get(apptRef) : null;
@@ -697,6 +750,7 @@ exports.adminSaveAppointment = onCall({ cors: true }, async (request) => {
       : null;
     const oldLockSnap = oldLockRef ? await tx.get(oldLockRef) : null;
     const lockSnap = oldLockRef && oldLockRef.path === newLock.path ? oldLockSnap : await tx.get(newLock);
+    await addCareTeam(tx, patientId, dentist.id, now);
 
     let newIntervals = cleanIntervals(lockSnap && lockSnap.exists ? lockSnap.data().intervals || [] : []);
     if (before) {
@@ -717,10 +771,12 @@ exports.adminSaveAppointment = onCall({ cors: true }, async (request) => {
       throw new HttpsError('already-exists', 'Ese odontólogo ya tiene una cita o una solicitud en ese horario.');
     }
 
-    newIntervals.push({
-      start, end, type: 'appointment', appointmentId: apptRef.id,
-      patientId, dentistId: dentist.id
-    });
+    if (status !== 'cancelled') {
+      newIntervals.push({
+        start, end, type: 'appointment', appointmentId: apptRef.id,
+        patientId, dentistId: dentist.id
+      });
+    }
 
     const data = {
       patientId,
@@ -728,6 +784,7 @@ exports.adminSaveAppointment = onCall({ cors: true }, async (request) => {
       treatment: treatment.id,
       treatmentName: treatment.n,
       dentistId: dentist.id,
+      dentistUid,
       dentistName: dentist.n,
       date,
       time,
@@ -776,8 +833,12 @@ exports.adminUpdateAppointmentStatus = onCall({ cors: true }, async (request) =>
     const snap = await tx.get(apptRef);
     if (!snap.exists) throw new HttpsError('not-found', 'La cita no existe.');
     const appt = snap.data();
-    if (auth.role === 'dentist' && appt.dentistId !== auth.uid) {
-      throw new HttpsError('permission-denied', 'Solo puedes gestionar tus propias citas.');
+    if (auth.role === 'dentist') {
+      const profile = await dentistProfileFor(auth.uid);
+      const own = appt.dentistUid === auth.uid ||
+        appt.dentistId === auth.uid ||
+        (profile && profile.dentistId && appt.dentistId === profile.dentistId);
+      if (!own) throw new HttpsError('permission-denied', 'Solo puedes gestionar tus propias citas.');
     }
     if (appt.status === status) return;
 
@@ -839,6 +900,7 @@ exports.acceptRequest = onCall({ cors: true }, async (request) => {
   const appointmentId = 'reqappt_' + requestId;
   const apptRef = db.doc('appointments/' + appointmentId);
   const lock = lockRef(date, dentistId);
+  const dentistUid = await dentistUidFor(dentistId);
 
   let patientId = req.patientId || '';
   if (!patientId) {
@@ -870,6 +932,7 @@ exports.acceptRequest = onCall({ cors: true }, async (request) => {
     const lockSnap = await tx.get(lock);
     let intervals = cleanIntervals(lockSnap.exists ? lockSnap.data().intervals || [] : []);
     intervals = intervals.filter((i) => i.requestId !== requestId && i.appointmentId !== appointmentId);
+    await addCareTeam(tx, patientId, dentistId, now);
 
     // The web hold may have been placed on a different dentist (preferred one was
     // busy). Release that hold so the rejected slot is not blocked until expiry.
@@ -893,7 +956,6 @@ exports.acceptRequest = onCall({ cors: true }, async (request) => {
       tx.set(patientRef, {
         fn: parts.fn, ln: parts.ln, bd: '', ph: req.phone || '', em: req.email || '',
         addr: '', assignedDentistId: dentistId, userId: '', status: 'active',
-        adminNotes: 'Creado desde solicitud web ' + (req.ref || requestId),
         searchName: `${parts.fn} ${parts.ln} ${req.email || ''}`.toLowerCase(),
         createdAt: now, createdBy: auth.uid, updatedAt: now
       });
@@ -908,6 +970,7 @@ exports.acceptRequest = onCall({ cors: true }, async (request) => {
       treatment: treatment.id,
       treatmentName: treatment.n,
       dentistId,
+      dentistUid,
       dentistName: dentist.n,
       date, time, status: 'confirmed',
       box: dentistId === 'd1' ? 'Gabinete 1' : 'Gabinete 2',
@@ -977,16 +1040,19 @@ exports.saveConsultation = onCall({ cors: true }, async (request) => {
   const treatment = treatmentOf(config, treatmentId);
 
   let dentistId;
+  let dentistUid = '';
   if (auth.role === 'dentist') {
-    const profileSnap = await db.doc('users/' + auth.uid).get();
-    const profile = profileSnap.exists ? profileSnap.data() : {};
-    dentistId = String(profile.dentistId || auth.uid);
+    const profile = await dentistProfileFor(auth.uid);
+    dentistId = String(profile?.dentistId || '');
+    if (!dentistId) throw new HttpsError('failed-precondition', 'Tu cuenta no está vinculada a un odontólogo del catálogo.');
+    dentistUid = auth.uid;
   } else {
     dentistId = clean(request.data?.dentistId || '', 120);
     if (!dentistId) throw new HttpsError('invalid-argument', 'Falta el odontólogo.');
     if (!config.dentists.some((d) => d.id === dentistId)) {
       throw new HttpsError('invalid-argument', 'El odontólogo no está en el catálogo.');
     }
+    dentistUid = await dentistUidFor(dentistId);
   }
   const dentist = config.dentists.find((d) => d.id === dentistId) || {};
 
@@ -1001,8 +1067,11 @@ exports.saveConsultation = onCall({ cors: true }, async (request) => {
   const patientSnap = await db.doc('patients/' + patientId).get();
   if (!patientSnap.exists) throw new HttpsError('not-found', 'Paciente no encontrado.');
   const patient = patientSnap.data();
-  if (auth.role === 'dentist' && patient.assignedDentistId !== auth.uid) {
-    throw new HttpsError('permission-denied', 'Solo puedes registrar consultas de pacientes asignados.');
+  if (auth.role === 'dentist') {
+    const team = Array.isArray(patient.careTeamIds) ? patient.careTeamIds : [];
+    if (patient.assignedDentistId !== dentistId && !team.includes(dentistId)) {
+      throw new HttpsError('permission-denied', 'Solo puedes registrar consultas de pacientes asignados.');
+    }
   }
 
   const now = Timestamp.now();
@@ -1014,6 +1083,7 @@ exports.saveConsultation = onCall({ cors: true }, async (request) => {
     treatment: treatment.id,
     treatmentName: treatment.n,
     dentistId,
+    dentistUid,
     dentistName: dentist.n || '',
     notes,
     diagnosis,
@@ -1042,8 +1112,12 @@ exports.updateConsultationShare = onCall({ cors: true }, async (request) => {
   const snap = await ref.get();
   if (!snap.exists) throw new HttpsError('not-found', 'La consulta no existe.');
   const data = snap.data();
-  if (auth.role === 'dentist' && data.dentistId !== auth.uid) {
-    throw new HttpsError('permission-denied', 'Solo puedes compartir tus propias consultas.');
+  if (auth.role === 'dentist') {
+    const profile = await dentistProfileFor(auth.uid);
+    const own = data.dentistUid === auth.uid ||
+      data.dentistId === auth.uid ||
+      (profile && profile.dentistId && data.dentistId === profile.dentistId);
+    if (!own) throw new HttpsError('permission-denied', 'Solo puedes compartir tus propias consultas.');
   }
   if (share && !String(data.sharedSummary || '').trim()) {
     throw new HttpsError('failed-precondition', 'Escribe primero un resumen para el paciente.');
@@ -1063,8 +1137,21 @@ exports.adminSetUserRole = onCall({ cors: true }, async (request) => {
   }
   const userSnap = await db.doc('users/' + uid).get();
   if (!userSnap.exists) throw new HttpsError('not-found', 'El usuario no existe.');
+  const profile = userSnap.data();
+  let dentistId = '';
+  if (role === 'dentist') {
+    dentistId = clean(request.data?.dentistId || profile.dentistId || '', 40);
+    if (!dentistId) {
+      throw new HttpsError('failed-precondition', 'El usuario necesita un odontólogo del catálogo para tener el rol de odontólogo.');
+    }
+  }
   await admin.auth().setCustomUserClaims(uid, { role });
-  await db.doc('users/' + uid).update({ role, updatedAt: Timestamp.now(), updatedBy: auth.uid });
+  await db.doc('users/' + uid).update({
+    role,
+    ...(role === 'dentist' ? { dentistId } : {}),
+    updatedAt: Timestamp.now(),
+    updatedBy: auth.uid
+  });
   await audit(auth, 'user.role', 'users', uid, { meta: { role } });
   return { ok: true };
 });
@@ -1078,6 +1165,18 @@ exports.adminCreateStaffUser = onCall({ cors: true }, async (request) => {
   if (role === 'patient') throw new HttpsError('invalid-argument', 'Usa el registro de pacientes para ese rol.');
   const password = String(request.data?.password || '');
   if (password.length < 10) throw new HttpsError('invalid-argument', 'La contraseña temporal debe tener al menos 10 caracteres.');
+  let dentistId = '';
+  if (role === 'dentist') {
+    dentistId = clean(request.data?.dentistId || '', 40);
+    const config = await loadConfig();
+    if (!dentistId || !config.dentists.some((d) => d.id === dentistId)) {
+      throw new HttpsError('invalid-argument', 'Selecciona un odontólogo del catálogo para esta cuenta.');
+    }
+    const already = await dentistUsers(true);
+    if (already.some((u) => u.dentistId === dentistId)) {
+      throw new HttpsError('already-exists', 'Ese odontólogo ya tiene una cuenta vinculada.');
+    }
+  }
 
   let userRecord;
   try {
@@ -1097,7 +1196,7 @@ exports.adminCreateStaffUser = onCall({ cors: true }, async (request) => {
       role,
       status: 'active',
       patientId: '',
-      dentistId: role === 'dentist' ? clean(request.data?.dentistId || userRecord.uid, 120) : '',
+      dentistId,
       preferences: { lang: 'es', theme: 'system', motion: 'system' },
       createdAt: Timestamp.now(),
       updatedAt: Timestamp.now(),
@@ -1122,7 +1221,217 @@ exports.syncMyClaims = onCall({ cors: true }, async (request) => {
   }
   const role = assertRole(profile.role || 'patient');
   await admin.auth().setCustomUserClaims(auth.uid, { role });
-  return { ok: true, role, patientId: profile.patientId || '' };
+  return { ok: true, role, patientId: profile.patientId || '', dentistId: profile.dentistId || '' };
+});
+
+/* ------------------------------------------------ administrative records */
+
+exports.adminSavePatient = onCall({ cors: true }, async (request) => {
+  appCheckGate(request);
+  const auth = requireAuth(request, ['admin', 'reception']);
+  const id = request.data?.id ? clean(request.data.id, 128, { label: 'paciente' }) : '';
+  const fn = clean(request.data?.fn, 80, { min: 1, label: 'nombre' });
+  const ln = clean(request.data?.ln, 120, { min: 1, label: 'apellidos' });
+  const bd = request.data?.bd ? assertDate(request.data.bd) : '';
+  const tel = phone(request.data?.ph || '', false);
+  const mail = email(request.data?.em);
+  const addr = clean(request.data?.addr || '', 300);
+  const status = ['active', 'inactive', 'suspended'].includes(request.data?.status)
+    ? request.data.status : 'active';
+  const assignedDentistId = clean(request.data?.assignedDentistId || '', 40);
+  if (assignedDentistId) {
+    const config = await loadConfig();
+    if (!config.dentists.some((d) => d.id === assignedDentistId)) {
+      throw new HttpsError('invalid-argument', 'El odontólogo asignado no está en el catálogo.');
+    }
+  }
+  const now = Timestamp.now();
+  const searchName = `${fn} ${ln} ${mail} ${tel}`.toLowerCase();
+  const patientRef = id ? db.doc('patients/' + id) : db.collection('patients').doc();
+  const existing = id ? await patientRef.get() : null;
+  if (id && (!existing || !existing.exists)) throw new HttpsError('not-found', 'El paciente no existe.');
+  const before = existing && existing.exists ? existing.data() : null;
+
+  const data = {
+    fn, ln, bd, ph: tel, em: mail, addr,
+    assignedDentistId: assignedDentistId || before?.assignedDentistId || '',
+    status,
+    searchName,
+    updatedAt: now,
+    updatedBy: auth.uid
+  };
+  if (!before) {
+    data.userId = '';
+    data.careTeamIds = assignedDentistId ? [assignedDentistId] : [];
+    data.createdAt = now;
+    data.createdBy = auth.uid;
+  }
+
+  // Vinculación segura: solo con cuentas cuyo correo esté verificado y que no
+  // estén ya vinculadas a otra ficha. La identidad sigue siendo responsabilidad
+  // del personal que crea/edita la ficha.
+  let linkedUid = before?.userId || '';
+  if (!linkedUid) {
+    const userQuery = await db.collection('users').where('email', '==', mail).limit(1).get();
+    if (!userQuery.empty) {
+      const userDoc = userQuery.docs[0];
+      const user = userDoc.data();
+      if (user.role === 'patient' && (!user.patientId || user.patientId === patientRef.id)) {
+        try {
+          const authUser = await admin.auth().getUser(userDoc.id);
+          if (authUser.emailVerified) {
+            linkedUid = userDoc.id;
+            data.userId = linkedUid;
+          }
+        } catch (error) {
+          logger.warn('No se pudo comprobar la verificación de la cuenta del paciente', error);
+        }
+      }
+    }
+  }
+
+  const batch = db.batch();
+  batch.set(patientRef, data, { merge: true });
+  if (linkedUid && linkedUid !== before?.userId) {
+    batch.set(db.doc('users/' + linkedUid), { patientId: patientRef.id, updatedAt: now }, { merge: true });
+  }
+  batch.set(db.collection('auditLogs').doc(), {
+    actorUid: auth.uid, actorRole: auth.role,
+    action: before ? 'patient.update' : 'patient.create',
+    entity: 'patients', entityId: patientRef.id,
+    patientId: patientRef.id, at: now,
+    meta: { linkedUserId: linkedUid || '' }
+  });
+  await batch.commit();
+
+  const saved = await patientRef.get();
+  return { ok: true, id: patientRef.id, patient: { id: patientRef.id, ...saved.data() } };
+});
+
+exports.adminSavePayment = onCall({ cors: true }, async (request) => {
+  appCheckGate(request);
+  const auth = requireAuth(request, ['admin', 'reception']);
+  const patientId = clean(request.data?.patientId, 128, { label: 'paciente' });
+  const patientSnap = await db.doc('patients/' + patientId).get();
+  if (!patientSnap.exists) throw new HttpsError('not-found', 'Paciente no encontrado.');
+  const patient = patientSnap.data();
+  const config = await loadConfig();
+  const treatmentId = clean(request.data?.treatment || 'revision', 40);
+  const treatment = config.treatments.find((t) => t.id === treatmentId);
+  const concept = clean(request.data?.concept || treatment?.n || 'Tratamiento', 300, { min: 1, label: 'concepto' });
+  const amount = Number(request.data?.amount);
+  if (!Number.isFinite(amount) || amount <= 0 || amount > 100000) {
+    throw new HttpsError('invalid-argument', 'Importe no válido.');
+  }
+  const status = ['pending', 'paid', 'refunded', 'void'].includes(request.data?.status)
+    ? request.data.status : 'pending';
+  const date = request.data?.date ? assertDate(request.data.date) : todayMadrid();
+  const invoiceNumber = clean(request.data?.invoiceNumber || '', 80);
+  const notes = cleanMultiline(request.data?.notes || '', 2000);
+  const now = Timestamp.now();
+  const ref = db.collection('payments').doc();
+  await ref.set({
+    patientId,
+    patientName: `${patient.fn || ''} ${patient.ln || ''}`.trim(),
+    treatment: treatmentId,
+    concept,
+    amount,
+    status,
+    date,
+    invoiceNumber,
+    notes,
+    createdAt: now,
+    updatedAt: now,
+    createdBy: auth.uid,
+    updatedBy: auth.uid,
+    ...(status === 'paid' ? { paidAt: now, paidBy: auth.uid } : {})
+  });
+  await audit(auth, 'payment.create', 'payments', ref.id, { patientId, meta: { amount, status } });
+  return { ok: true, id: ref.id };
+});
+
+exports.adminUpdatePaymentStatus = onCall({ cors: true }, async (request) => {
+  appCheckGate(request);
+  const auth = requireAuth(request, ['admin', 'reception']);
+  const id = clean(request.data?.id, 128, { label: 'pago' });
+  const status = clean(request.data?.status, 20);
+  if (!PAY_STATUS.includes(status)) throw new HttpsError('invalid-argument', 'Estado de pago no válido.');
+  const ref = db.doc('payments/' + id);
+  const snap = await ref.get();
+  if (!snap.exists) throw new HttpsError('not-found', 'El pago no existe.');
+  const data = snap.data();
+  const now = Timestamp.now();
+  await ref.update({
+    status,
+    updatedAt: now,
+    updatedBy: auth.uid,
+    ...(status === 'paid' ? { paidAt: now, paidBy: auth.uid } : {})
+  });
+  await audit(auth, 'payment.status', 'payments', id, {
+    patientId: data.patientId || '', meta: { status, amount: data.amount || 0 }
+  });
+  return { ok: true };
+});
+
+exports.adminSetUserStatus = onCall({ cors: true }, async (request) => {
+  appCheckGate(request);
+  const auth = requireAuth(request, ['admin']);
+  const uid = clean(request.data?.uid, 128, { label: 'usuario' });
+  const status = clean(request.data?.status, 20);
+  if (!['active', 'inactive', 'suspended'].includes(status)) {
+    throw new HttpsError('invalid-argument', 'Estado de cuenta no válido.');
+  }
+  if (uid === auth.uid && status !== 'active') {
+    throw new HttpsError('failed-precondition', 'No puedes desactivar tu propia cuenta.');
+  }
+  const ref = db.doc('users/' + uid);
+  const snap = await ref.get();
+  if (!snap.exists) throw new HttpsError('not-found', 'El usuario no existe.');
+  const disabled = status !== 'active';
+  await admin.auth().updateUser(uid, { disabled });
+  if (disabled) await admin.auth().revokeRefreshTokens(uid);
+  await ref.update({ status, updatedAt: Timestamp.now(), updatedBy: auth.uid });
+  await audit(auth, 'user.status', 'users', uid, { meta: { status } });
+  return { ok: true };
+});
+
+exports.adminLinkPatientAccount = onCall({ cors: true }, async (request) => {
+  appCheckGate(request);
+  const auth = requireAuth(request, ['admin']);
+  const patientId = clean(request.data?.patientId, 128, { label: 'paciente' });
+  const uid = clean(request.data?.uid, 128, { label: 'usuario' });
+  const [patientSnap, userSnap, authUser] = await Promise.all([
+    db.doc('patients/' + patientId).get(),
+    db.doc('users/' + uid).get(),
+    admin.auth().getUser(uid)
+  ]);
+  if (!patientSnap.exists) throw new HttpsError('not-found', 'La ficha del paciente no existe.');
+  if (!userSnap.exists) throw new HttpsError('not-found', 'La cuenta de usuario no existe.');
+  if (!authUser.emailVerified) {
+    throw new HttpsError('failed-precondition', 'La cuenta debe tener el correo verificado antes de vincularse.');
+  }
+  const patient = patientSnap.data();
+  const user = userSnap.data();
+  if (user.role !== 'patient') throw new HttpsError('failed-precondition', 'La cuenta no es de paciente.');
+  if (String(patient.em || '').toLowerCase() !== String(authUser.email || '').toLowerCase()) {
+    throw new HttpsError('failed-precondition', 'El correo de la ficha y de la cuenta no coinciden.');
+  }
+  if (patient.userId && patient.userId !== uid) {
+    throw new HttpsError('failed-precondition', 'La ficha ya está vinculada a otra cuenta.');
+  }
+  if (user.patientId && user.patientId !== patientId) {
+    throw new HttpsError('failed-precondition', 'La cuenta ya está vinculada a otra ficha.');
+  }
+  const now = Timestamp.now();
+  const batch = db.batch();
+  batch.set(db.doc('patients/' + patientId), { userId: uid, updatedAt: now, updatedBy: auth.uid }, { merge: true });
+  batch.set(db.doc('users/' + uid), { patientId, updatedAt: now }, { merge: true });
+  batch.set(db.collection('auditLogs').doc(), {
+    actorUid: auth.uid, actorRole: auth.role, action: 'patient.link_account',
+    entity: 'patients', entityId: patientId, patientId, at: now, meta: { uid }
+  });
+  await batch.commit();
+  return { ok: true };
 });
 
 /* -------------------------------------------------------- server triggers */

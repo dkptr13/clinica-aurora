@@ -6,11 +6,12 @@ rules_version = '2';
 // Estructura:
 //   patients/{patientId}/clinical/**   → solo personal clínico autorizado
 //   patients/{patientId}/shared/**     → personal clínico + paciente propietario
-//   patients/{patientId}/admin/**      → administración (facturas, consentimientos)
+//   patients/{patientId}/admin/**      → administración (facturas, documentos)
 //   patients/{patientId}/invoices/**   → administración + paciente propietario
 //
 // Nunca se generan URL públicas permanentes. La app descarga con getBlob() y
-// crea un object URL temporal en memoria.
+// crea un object URL temporal en memoria. La recepción no accede a la carpeta
+// clínica ni a la compartida (puede contener imágenes clínicas).
 // ============================================================================
 
 service firebase.storage {
@@ -44,6 +45,16 @@ service firebase.storage {
       return isAdmin() || isDentist();
     }
 
+    function userDoc() {
+      return firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function myDentistId() {
+      return signedIn() &&
+        firestore.exists(/databases/(default)/documents/users/$(request.auth.uid))
+        ? userDoc().dentistId : '';
+    }
+
     function patientDoc(pid) {
       return firestore.get(/databases/(default)/documents/patients/$(pid)).data;
     }
@@ -58,8 +69,10 @@ service firebase.storage {
 
     function assignedDentist(pid) {
       return isDentist() &&
-        firestore.exists(/databases/(default)/documents/patients/$(pid)) &&
-        patientDoc(pid).assignedDentistId == request.auth.uid;
+        firestore.exists(/databases/(default)/documents/patients/$(pid)) && (
+          (myDentistId() != '' && patientDoc(pid).assignedDentistId == myDentistId()) ||
+          (patientDoc(pid).careTeamIds is list && myDentistId() in patientDoc(pid).careTeamIds)
+        );
     }
 
     function safeFile() {
@@ -82,7 +95,6 @@ service firebase.storage {
     match /patients/{patientId}/shared/{allPaths=**} {
       allow read: if isAdmin() ||
         assignedDentist(patientId) ||
-        isReception() ||
         ownsPatient(patientId);
       allow create, update: if isClinical() && (isAdmin() || assignedDentist(patientId)) &&
         safeFile() && safeName();
@@ -91,13 +103,13 @@ service firebase.storage {
 
     match /patients/{patientId}/admin/{allPaths=**} {
       allow read: if isAdmin() || isReception();
-      allow create, update: if isAdmin() || isReception();
+      allow create, update: if (isAdmin() || isReception()) && safeFile() && safeName();
       allow delete: if isAdmin();
     }
 
     match /patients/{patientId}/invoices/{allPaths=**} {
       allow read: if isAdmin() || isReception() || ownsPatient(patientId);
-      allow create, update: if isAdmin() || isReception();
+      allow create, update: if (isAdmin() || isReception()) && safeFile() && safeName();
       allow delete: if isAdmin();
     }
 
